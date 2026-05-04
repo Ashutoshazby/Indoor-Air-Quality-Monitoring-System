@@ -1,0 +1,157 @@
+#include <DHT.h>
+#include <SoftwareSerial.h>
+
+// ---------------- CONFIG ----------------
+#define DHTPIN D4
+#define DHTTYPE DHT22
+
+#define LED D2
+#define BUZZER D5
+#define MQ_PIN A0
+
+// PMS (RX, TX)
+SoftwareSerial pmsSerial(D6, D7);
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// PMS structure
+struct PMS {
+  uint16_t pm2_5;
+  uint16_t pm10;
+} pms;
+
+// -------- FILTER --------
+#define SAMPLE_SIZE 5
+int pm25Samples[SAMPLE_SIZE] = {0};
+int sampleIndex = 0;
+
+int lastPm25 = 0;
+int lastPm10 = 0;
+
+// -------- DHT FALLBACK --------
+float lastTemp = 0;
+float lastHum = 0;
+
+// -------- SETUP --------
+void setup() {
+  Serial.begin(115200);
+  pmsSerial.begin(9600);
+  dht.begin();
+
+  pinMode(LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  delay(2000);
+  Serial.println("🚀 IAQ System Started...");
+}
+
+// -------- PMS READ --------
+bool readPMS() {
+  if (pmsSerial.available() >= 32) {
+    if (pmsSerial.read() == 0x42 && pmsSerial.read() == 0x4D) {
+      uint8_t buffer[30];
+      pmsSerial.readBytes(buffer, 30);
+
+      uint16_t pm25 = (buffer[6] << 8) | buffer[7];
+      uint16_t pm10 = (buffer[8] << 8) | buffer[9];
+
+      if (pm25 < 1000 && pm10 < 1000) {
+        pms.pm2_5 = pm25;
+        pms.pm10  = pm10;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// -------- MOVING AVERAGE --------
+int getFilteredPM25(int newValue) {
+  pm25Samples[sampleIndex] = newValue;
+  sampleIndex = (sampleIndex + 1) % SAMPLE_SIZE;
+
+  int sum = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sum += pm25Samples[i];
+  }
+  return sum / SAMPLE_SIZE;
+}
+
+// -------- AQI --------
+int calculateAQI(int pm25) {
+  if (pm25 <= 12) return map(pm25, 0, 12, 0, 50);
+  else if (pm25 <= 35) return map(pm25, 12, 35, 51, 100);
+  else if (pm25 <= 55) return map(pm25, 35, 55, 101, 150);
+  else if (pm25 <= 150) return map(pm25, 55, 150, 151, 200);
+  else return map(pm25, 150, 300, 201, 300);
+}
+
+// -------- AQI STATUS --------
+String getAQIStatus(int aqi) {
+  if (aqi <= 50) return "Good";
+  else if (aqi <= 100) return "Moderate";
+  else if (aqi <= 150) return "Unhealthy (Sensitive)";
+  else if (aqi <= 200) return "Unhealthy";
+  else return "Hazardous";
+}
+
+// -------- LOOP --------
+void loop() {
+
+  // ✅ READ DHT FIRST (avoid conflict)
+  float temp = dht.readTemperature();
+  float hum  = dht.readHumidity();
+
+  // 🔥 HANDLE DHT FAILURE
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("⚠️ DHT failed → using last values");
+    temp = lastTemp;
+    hum  = lastHum;
+  } else {
+    lastTemp = temp;
+    lastHum  = hum;
+  }
+
+  delay(50); // 🔥 important for stability
+
+  int mqRaw = analogRead(MQ_PIN);
+
+  // -------- PMS --------
+  if (readPMS()) {
+
+    int pm25Filtered = getFilteredPM25(pms.pm2_5);
+
+    if (pm25Filtered < 0 || pm25Filtered > 500) pm25Filtered = lastPm25;
+    if (pms.pm10 < 0 || pms.pm10 > 500) pms.pm10 = lastPm10;
+
+    lastPm25 = pm25Filtered;
+    lastPm10 = pms.pm10;
+
+    int aqi = calculateAQI(pm25Filtered);
+    String status = getAQIStatus(aqi);
+
+    // -------- OUTPUT --------
+    Serial.println("\n===== IAQ REPORT =====");
+    Serial.print("Temp: "); Serial.print(temp); Serial.println(" °C");
+    Serial.print("Humidity: "); Serial.print(hum); Serial.println(" %");
+
+    Serial.print("PM2.5: "); Serial.print(pm25Filtered); Serial.println(" µg/m³");
+    Serial.print("PM10: "); Serial.print(pms.pm10); Serial.println(" µg/m³");
+
+    Serial.print("Gas Raw: "); Serial.println(mqRaw);
+    Serial.print("AQI: "); Serial.print(aqi);
+    Serial.print(" ("); Serial.print(status); Serial.println(")");
+    Serial.println("======================");
+
+    // -------- ALERT --------
+    if (aqi > 150 || mqRaw > 500) {
+      digitalWrite(LED, HIGH);
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      digitalWrite(LED, LOW);
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+
+  delay(2000);
+}
